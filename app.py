@@ -1,7 +1,10 @@
 import os
 import json
-import math
 import re
+import shutil
+import subprocess
+import time
+import urllib.request
 import streamlit as st
 
 from PyPDF2 import PdfReader
@@ -17,8 +20,328 @@ DATA_DIR = "rag_data"
 DOCUMENTS_FILE = os.path.join(DATA_DIR, "documents.json")
 
 OLLAMA_MODEL = "qwen3:1.7b"
+OLLAMA_HOST = "127.0.0.1"
+OLLAMA_PORT = 11434
+OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
 
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# ============================================================
+# OLLAMA SETUP
+# ============================================================
+
+def run_command(command):
+    """
+    Run a shell command and return its output.
+    """
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        return (
+            result.returncode,
+            result.stdout,
+            result.stderr
+        )
+
+    except subprocess.TimeoutExpired:
+        return (
+            -1,
+            "",
+            "Command timed out."
+        )
+
+    except Exception as e:
+        return (
+            -1,
+            "",
+            str(e)
+        )
+
+
+def ollama_is_installed():
+    """
+    Check whether Ollama is installed.
+    """
+
+    return shutil.which("ollama") is not None
+
+
+def install_ollama():
+    """
+    Install Ollama automatically if it is not installed.
+
+    Ollama provides an official Linux installation script.
+    """
+
+    st.info("🦙 Ollama is not installed. Installing Ollama...")
+
+    try:
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "curl -fsSL https://ollama.com/install.sh | sh"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
+
+        if result.returncode != 0:
+
+            st.error(
+                "❌ Ollama installation failed."
+            )
+
+            st.code(
+                result.stderr,
+                language="text"
+            )
+
+            return False
+
+        st.success(
+            "✅ Ollama installed successfully."
+        )
+
+        return True
+
+    except Exception as e:
+
+        st.error(
+            f"❌ Could not install Ollama: {e}"
+        )
+
+        return False
+
+
+def ollama_server_running():
+    """
+    Check whether the Ollama server is responding.
+    """
+
+    try:
+
+        with urllib.request.urlopen(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=3
+        ) as response:
+
+            return response.status == 200
+
+    except Exception:
+        return False
+
+
+def start_ollama_server():
+    """
+    Start Ollama in the background.
+    """
+
+    if ollama_server_running():
+        return True
+
+    st.info("🦙 Starting Ollama server...")
+
+    try:
+
+        env = os.environ.copy()
+
+        env["OLLAMA_HOST"] = (
+            f"{OLLAMA_HOST}:{OLLAMA_PORT}"
+        )
+
+        # Start Ollama in background.
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"❌ Could not start Ollama: {e}"
+        )
+
+        return False
+
+    # Wait for server to become available.
+    for _ in range(30):
+
+        if ollama_server_running():
+
+            st.success(
+                "✅ Ollama server is running."
+            )
+
+            return True
+
+        time.sleep(1)
+
+    st.error(
+        "❌ Ollama server did not start within "
+        "the expected time."
+    )
+
+    return False
+
+
+def ollama_model_exists():
+    """
+    Check whether the required model exists.
+    """
+
+    try:
+
+        result = subprocess.run(
+            [
+                "ollama",
+                "list"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            return False
+
+        return OLLAMA_MODEL in result.stdout
+
+    except Exception:
+        return False
+
+
+def pull_ollama_model():
+    """
+    Download the required Ollama model.
+    """
+
+    st.info(
+        f"📥 Downloading `{OLLAMA_MODEL}`..."
+    )
+
+    st.warning(
+        "⚠️ The first startup may take several minutes "
+        "because the model must be downloaded."
+    )
+
+    try:
+
+        process = subprocess.Popen(
+            [
+                "ollama",
+                "pull",
+                OLLAMA_MODEL
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        output_lines = []
+
+        if process.stdout:
+
+            for line in process.stdout:
+
+                line = line.strip()
+
+                if line:
+                    output_lines.append(line)
+
+        return_code = process.wait()
+
+        if return_code != 0:
+
+            st.error(
+                "❌ Failed to download the Ollama model."
+            )
+
+            if output_lines:
+
+                st.code(
+                    "\n".join(output_lines[-30:]),
+                    language="text"
+                )
+
+            return False
+
+        st.success(
+            f"✅ `{OLLAMA_MODEL}` downloaded successfully."
+        )
+
+        return True
+
+    except Exception as e:
+
+        st.error(
+            f"❌ Could not download model: {e}"
+        )
+
+        return False
+
+
+@st.cache_resource
+def initialize_ollama():
+    """
+    Complete Ollama initialization.
+
+    This function:
+
+    1. Checks whether Ollama is installed.
+    2. Installs Ollama if necessary.
+    3. Starts the Ollama server.
+    4. Downloads qwen3:1.7b if necessary.
+    """
+
+    # --------------------------------------------------------
+    # STEP 1 — Install Ollama
+    # --------------------------------------------------------
+
+    if not ollama_is_installed():
+
+        if not install_ollama():
+
+            return False
+
+    # --------------------------------------------------------
+    # STEP 2 — Start Ollama
+    # --------------------------------------------------------
+
+    if not start_ollama_server():
+
+        return False
+
+    # --------------------------------------------------------
+    # STEP 3 — Download model
+    # --------------------------------------------------------
+
+    if not ollama_model_exists():
+
+        if not pull_ollama_model():
+
+            return False
+
+    return True
+
+
+# ============================================================
+# INITIALIZE OLLAMA
+# ============================================================
+
+ollama_ready = initialize_ollama()
 
 
 # ============================================================
@@ -81,14 +404,12 @@ Answer in the format described above:
 # ============================================================
 
 def load_documents():
-    """
-    Load saved documents from JSON.
-    """
 
     if not os.path.exists(DOCUMENTS_FILE):
         return []
 
     try:
+
         with open(
             DOCUMENTS_FILE,
             "r",
@@ -101,7 +422,10 @@ def load_documents():
                 return data
 
     except Exception as e:
-        st.error(f"Could not load document database: {e}")
+
+        st.error(
+            f"Could not load document database: {e}"
+        )
 
     return []
 
@@ -111,9 +435,6 @@ def load_documents():
 # ============================================================
 
 def save_documents(documents):
-    """
-    Save documents to JSON.
-    """
 
     with open(
         DOCUMENTS_FILE,
@@ -134,15 +455,8 @@ def save_documents(documents):
 # ============================================================
 
 def extract_text_from_file(uploaded_file):
-    """
-    Extract text from PDF or TXT.
-    """
 
     filename = uploaded_file.name.lower()
-
-    # -----------------------------
-    # PDF
-    # -----------------------------
 
     if filename.endswith(".pdf"):
 
@@ -164,14 +478,11 @@ def extract_text_from_file(uploaded_file):
         except Exception as e:
 
             st.error(
-                f"Could not read PDF '{uploaded_file.name}': {e}"
+                f"Could not read PDF "
+                f"'{uploaded_file.name}': {e}"
             )
 
             return None
-
-    # -----------------------------
-    # TXT
-    # -----------------------------
 
     if filename.endswith(".txt"):
 
@@ -187,7 +498,8 @@ def extract_text_from_file(uploaded_file):
         except Exception as e:
 
             st.error(
-                f"Could not read TXT '{uploaded_file.name}': {e}"
+                f"Could not read TXT "
+                f"'{uploaded_file.name}': {e}"
             )
 
             return None
@@ -200,14 +512,14 @@ def extract_text_from_file(uploaded_file):
 # ============================================================
 
 def clean_text(text):
-    """
-    Clean extracted document text.
-    """
 
     if not text:
         return ""
 
-    text = text.replace("\x00", " ")
+    text = text.replace(
+        "\x00",
+        " "
+    )
 
     text = re.sub(
         r"\s+",
@@ -227,12 +539,6 @@ def split_into_chunks(
     chunk_size=1200,
     overlap=200
 ):
-    """
-    Split document into smaller chunks.
-
-    This implementation uses only Python's standard library.
-    No NumPy, ChromaDB, or native DLLs are required.
-    """
 
     text = clean_text(text)
 
@@ -275,9 +581,6 @@ def split_into_chunks(
 # ============================================================
 
 def tokenize(text):
-    """
-    Convert text into simple lowercase word tokens.
-    """
 
     return set(
         re.findall(
@@ -295,25 +598,22 @@ def similarity_score(
     query,
     document
 ):
-    """
-    Calculate simple similarity using word overlap.
-
-    This deliberately avoids NumPy and native vector libraries.
-    """
 
     query_words = tokenize(query)
+
     document_words = tokenize(document)
 
     if not query_words or not document_words:
         return 0.0
 
     intersection = (
-        query_words & document_words
+        query_words &
+        document_words
     )
 
-    # Basic Jaccard similarity
     union = (
-        query_words | document_words
+        query_words |
+        document_words
     )
 
     if not union:
@@ -324,8 +624,8 @@ def similarity_score(
         / len(union)
     )
 
-    # Extra score for exact phrase matches
     query_lower = query.lower().strip()
+
     document_lower = document.lower()
 
     if (
@@ -334,7 +634,6 @@ def similarity_score(
     ):
         score += 1.0
 
-    # Extra score for important individual words
     important_words = [
         word
         for word in query_words
@@ -366,9 +665,6 @@ def retrieve_relevant_chunks(
     documents,
     top_k=5
 ):
-    """
-    Find the most relevant chunks.
-    """
 
     scored_chunks = []
 
@@ -417,9 +713,6 @@ def add_document(
     filename,
     text
 ):
-    """
-    Add a document to the local JSON knowledge base.
-    """
 
     text = clean_text(text)
 
@@ -437,7 +730,6 @@ def add_document(
 
     documents = load_documents()
 
-    # Remove previous copy of same filename
     documents = [
         document
         for document in documents
@@ -464,9 +756,13 @@ def generate_answer(
     question,
     context
 ):
-    """
-    Send retrieved context to Ollama.
-    """
+
+    if not ollama_ready:
+
+        return (
+            "❌ Ollama is not available. "
+            "The AI model could not be started."
+        )
 
     prompt_template = (
         ChatPromptTemplate.from_template(
@@ -481,6 +777,7 @@ def generate_answer(
 
     model = OllamaLLM(
         model=OLLAMA_MODEL,
+        base_url=OLLAMA_URL,
         options={
             "num_predict": 800,
             "temperature": 0.3
@@ -494,7 +791,6 @@ def generate_answer(
 
     response = str(response)
 
-    # Remove <think>...</think>
     response = re.sub(
         r"<think>.*?</think>",
         "",
@@ -510,9 +806,6 @@ def generate_answer(
 # ============================================================
 
 def query_rag(question):
-    """
-    Retrieve relevant chunks and ask Ollama.
-    """
 
     documents = load_documents()
 
@@ -585,6 +878,23 @@ st.title("📚 RAG-Chatbot")
 st.markdown(
     "Chat with your PDFs like a **Gen-Z Teacher** 📚"
 )
+
+
+# ============================================================
+# OLLAMA STATUS
+# ============================================================
+
+if ollama_ready:
+
+    st.success(
+        f"🦙 Ollama is ready • `{OLLAMA_MODEL}`"
+    )
+
+else:
+
+    st.error(
+        "❌ Ollama could not be initialized."
+    )
 
 
 # ============================================================
