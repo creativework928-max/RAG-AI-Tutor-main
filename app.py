@@ -1,15 +1,21 @@
 import os
 import json
 import re
-import shutil
-import subprocess
-import time
-import urllib.request
+import requests
 import streamlit as st
 
 from PyPDF2 import PdfReader
-from langchain_ollama import OllamaLLM
-from langchain_core.prompts import ChatPromptTemplate
+
+
+# ============================================================
+# STREAMLIT CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="RAG AI Tutor",
+    page_icon="📚",
+    layout="centered"
+)
 
 
 # ============================================================
@@ -17,331 +23,98 @@ from langchain_core.prompts import ChatPromptTemplate
 # ============================================================
 
 DATA_DIR = "rag_data"
-DOCUMENTS_FILE = os.path.join(DATA_DIR, "documents.json")
 
-OLLAMA_MODEL = "qwen3:1.7b"
-OLLAMA_HOST = "127.0.0.1"
-OLLAMA_PORT = 11434
-OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
+DOCUMENTS_FILE = os.path.join(
+    DATA_DIR,
+    "documents.json"
+)
 
-os.makedirs(DATA_DIR, exist_ok=True)
+# ------------------------------------------------------------
+# Ollama Cloud
+# ------------------------------------------------------------
+
+OLLAMA_API_URL = "https://ollama.com/api/chat"
+
+# Cloud-enabled Qwen model.
+#
+# You can change this later to another Ollama Cloud model.
+#
+# IMPORTANT:
+# Do NOT use qwen3:1.7b here.
+# qwen3:1.7b is a local model.
+#
+OLLAMA_MODEL = "qwen3.5:2b"
+
+# Maximum generated tokens
+MAX_OUTPUT_TOKENS = 800
+
+# Model temperature
+TEMPERATURE = 0.3
+
+# Number of retrieved chunks
+TOP_K = 5
+
+os.makedirs(
+    DATA_DIR,
+    exist_ok=True
+)
 
 
 # ============================================================
-# OLLAMA SETUP
+# OLLAMA CLOUD API KEY
 # ============================================================
 
-def run_command(command):
+def get_ollama_api_key():
     """
-    Run a shell command and return its output.
-    """
+    Get Ollama Cloud API key from Streamlit Secrets.
 
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
+    Expected Streamlit secret:
 
-        return (
-            result.returncode,
-            result.stdout,
-            result.stderr
-        )
-
-    except subprocess.TimeoutExpired:
-        return (
-            -1,
-            "",
-            "Command timed out."
-        )
-
-    except Exception as e:
-        return (
-            -1,
-            "",
-            str(e)
-        )
-
-
-def ollama_is_installed():
-    """
-    Check whether Ollama is installed.
-    """
-
-    return shutil.which("ollama") is not None
-
-
-def install_ollama():
-    """
-    Install Ollama automatically if it is not installed.
-
-    Ollama provides an official Linux installation script.
-    """
-
-    st.info("🦙 Ollama is not installed. Installing Ollama...")
-
-    try:
-
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                "curl -fsSL https://ollama.com/install.sh | sh"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=600
-        )
-
-        if result.returncode != 0:
-
-            st.error(
-                "❌ Ollama installation failed."
-            )
-
-            st.code(
-                result.stderr,
-                language="text"
-            )
-
-            return False
-
-        st.success(
-            "✅ Ollama installed successfully."
-        )
-
-        return True
-
-    except Exception as e:
-
-        st.error(
-            f"❌ Could not install Ollama: {e}"
-        )
-
-        return False
-
-
-def ollama_server_running():
-    """
-    Check whether the Ollama server is responding.
+        OLLAMA_API_KEY = "your-api-key"
     """
 
     try:
 
-        with urllib.request.urlopen(
-            f"{OLLAMA_URL}/api/tags",
-            timeout=3
-        ) as response:
+        api_key = st.secrets.get(
+            "OLLAMA_API_KEY",
+            ""
+        )
 
-            return response.status == 200
+        return str(api_key).strip()
 
     except Exception:
-        return False
+
+        return ""
 
 
-def start_ollama_server():
-    """
-    Start Ollama in the background.
-    """
-
-    if ollama_server_running():
-        return True
-
-    st.info("🦙 Starting Ollama server...")
-
-    try:
-
-        env = os.environ.copy()
-
-        env["OLLAMA_HOST"] = (
-            f"{OLLAMA_HOST}:{OLLAMA_PORT}"
-        )
-
-        # Start Ollama in background.
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"❌ Could not start Ollama: {e}"
-        )
-
-        return False
-
-    # Wait for server to become available.
-    for _ in range(30):
-
-        if ollama_server_running():
-
-            st.success(
-                "✅ Ollama server is running."
-            )
-
-            return True
-
-        time.sleep(1)
-
-    st.error(
-        "❌ Ollama server did not start within "
-        "the expected time."
-    )
-
-    return False
-
-
-def ollama_model_exists():
-    """
-    Check whether the required model exists.
-    """
-
-    try:
-
-        result = subprocess.run(
-            [
-                "ollama",
-                "list"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        if result.returncode != 0:
-            return False
-
-        return OLLAMA_MODEL in result.stdout
-
-    except Exception:
-        return False
-
-
-def pull_ollama_model():
-    """
-    Download the required Ollama model.
-    """
-
-    st.info(
-        f"📥 Downloading `{OLLAMA_MODEL}`..."
-    )
-
-    st.warning(
-        "⚠️ The first startup may take several minutes "
-        "because the model must be downloaded."
-    )
-
-    try:
-
-        process = subprocess.Popen(
-            [
-                "ollama",
-                "pull",
-                OLLAMA_MODEL
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-
-        output_lines = []
-
-        if process.stdout:
-
-            for line in process.stdout:
-
-                line = line.strip()
-
-                if line:
-                    output_lines.append(line)
-
-        return_code = process.wait()
-
-        if return_code != 0:
-
-            st.error(
-                "❌ Failed to download the Ollama model."
-            )
-
-            if output_lines:
-
-                st.code(
-                    "\n".join(output_lines[-30:]),
-                    language="text"
-                )
-
-            return False
-
-        st.success(
-            f"✅ `{OLLAMA_MODEL}` downloaded successfully."
-        )
-
-        return True
-
-    except Exception as e:
-
-        st.error(
-            f"❌ Could not download model: {e}"
-        )
-
-        return False
-
-
-@st.cache_resource
-def initialize_ollama():
-    """
-    Complete Ollama initialization.
-
-    This function:
-
-    1. Checks whether Ollama is installed.
-    2. Installs Ollama if necessary.
-    3. Starts the Ollama server.
-    4. Downloads qwen3:1.7b if necessary.
-    """
-
-    # --------------------------------------------------------
-    # STEP 1 — Install Ollama
-    # --------------------------------------------------------
-
-    if not ollama_is_installed():
-
-        if not install_ollama():
-
-            return False
-
-    # --------------------------------------------------------
-    # STEP 2 — Start Ollama
-    # --------------------------------------------------------
-
-    if not start_ollama_server():
-
-        return False
-
-    # --------------------------------------------------------
-    # STEP 3 — Download model
-    # --------------------------------------------------------
-
-    if not ollama_model_exists():
-
-        if not pull_ollama_model():
-
-            return False
-
-    return True
+OLLAMA_API_KEY = get_ollama_api_key()
 
 
 # ============================================================
-# INITIALIZE OLLAMA
+# OLLAMA CLOUD CONNECTION TEST
 # ============================================================
 
-ollama_ready = initialize_ollama()
+@st.cache_data(ttl=300)
+def test_ollama_cloud():
+
+    """
+    Test whether Ollama Cloud credentials are configured.
+
+    This does NOT install Ollama.
+    This does NOT start a local Ollama server.
+
+    It only verifies that an API key exists.
+    """
+
+    api_key = get_ollama_api_key()
+
+    if not api_key:
+
+        return False, (
+            "OLLAMA_API_KEY is not configured."
+        )
+
+    return True, "Ollama Cloud API key configured."
 
 
 # ============================================================
@@ -360,42 +133,54 @@ like explaining it to a friend.
 
 Add a few appropriate emojis and make the content fun to read.
 
+IMPORTANT:
+Do not expose your internal reasoning or thinking process.
+
 Do not show <think></think> content in the answer.
 
-Format the answer in two parts:
-
-1. 2 Mark Answer
-   - Give the core definition/key point.
-   - Keep it short and exam-friendly.
-   - Around 4-5 lines.
-
-2. 16 Mark Answer
-   - Give a detailed explanation.
-   - Start with an introduction.
-   - Explain 5-6 important sub-topics/key points.
-   - Give suitable examples.
-   - Describe diagrams in words when useful.
-   - Use simple analogies where appropriate.
-   - End with a conclusion.
-   - Keep the answer structured and useful for exam preparation.
-   - Make it engaging like a Gen-Z teacher.
-
-IMPORTANT:
 Use ONLY the provided context to answer factual questions.
 
-If the answer cannot be found in the context, clearly say:
+If the answer cannot be found in the provided context, clearly say:
 
 "The information is not available in the uploaded documents."
 
 Do not invent information.
 
-Context:
+Format the answer in exactly two major parts:
+
+1. 2 Mark Answer
+
+- Give the core definition/key point.
+- Keep it short and exam-friendly.
+- Around 4-5 lines.
+- Use simple language.
+
+2. 16 Mark Answer
+
+- Start with a short introduction.
+- Explain 5-6 important sub-topics/key points.
+- Give suitable examples.
+- Describe diagrams in words when useful.
+- Use simple analogies where appropriate.
+- End with a conclusion.
+- Keep the answer structured and useful for exam preparation.
+- Make it engaging like a Gen-Z teacher.
+
+------------------------------------------------------------
+PROVIDED CONTEXT
+------------------------------------------------------------
+
 {context}
 
-Question:
+------------------------------------------------------------
+QUESTION
+------------------------------------------------------------
+
 {question}
 
-Answer in the format described above:
+------------------------------------------------------------
+ANSWER
+------------------------------------------------------------
 """
 
 
@@ -404,8 +189,13 @@ Answer in the format described above:
 # ============================================================
 
 def load_documents():
+    """
+    Load saved documents from JSON.
+    """
 
-    if not os.path.exists(DOCUMENTS_FILE):
+    if not os.path.exists(
+        DOCUMENTS_FILE
+    ):
         return []
 
     try:
@@ -418,8 +208,8 @@ def load_documents():
 
             data = json.load(f)
 
-            if isinstance(data, list):
-                return data
+        if isinstance(data, list):
+            return data
 
     except Exception as e:
 
@@ -435,6 +225,9 @@ def load_documents():
 # ============================================================
 
 def save_documents(documents):
+    """
+    Save documents to local JSON.
+    """
 
     with open(
         DOCUMENTS_FILE,
@@ -455,23 +248,37 @@ def save_documents(documents):
 # ============================================================
 
 def extract_text_from_file(uploaded_file):
+    """
+    Extract text from PDF or TXT.
+    """
 
     filename = uploaded_file.name.lower()
+
+    # --------------------------------------------------------
+    # PDF
+    # --------------------------------------------------------
 
     if filename.endswith(".pdf"):
 
         try:
 
-            reader = PdfReader(uploaded_file)
+            reader = PdfReader(
+                uploaded_file
+            )
 
             pages = []
 
             for page in reader.pages:
 
-                text = page.extract_text()
+                try:
 
-                if text:
-                    pages.append(text)
+                    text = page.extract_text()
+
+                    if text:
+                        pages.append(text)
+
+                except Exception:
+                    continue
 
             return "\n".join(pages)
 
@@ -483,6 +290,10 @@ def extract_text_from_file(uploaded_file):
             )
 
             return None
+
+    # --------------------------------------------------------
+    # TXT
+    # --------------------------------------------------------
 
     if filename.endswith(".txt"):
 
@@ -512,6 +323,9 @@ def extract_text_from_file(uploaded_file):
 # ============================================================
 
 def clean_text(text):
+    """
+    Clean extracted document text.
+    """
 
     if not text:
         return ""
@@ -539,6 +353,11 @@ def split_into_chunks(
     chunk_size=1200,
     overlap=200
 ):
+    """
+    Split document into overlapping word chunks.
+
+    No vector database required.
+    """
 
     text = clean_text(text)
 
@@ -563,7 +382,10 @@ def split_into_chunks(
         )
 
         if chunk.strip():
-            chunks.append(chunk)
+
+            chunks.append(
+                chunk
+            )
 
         if end >= len(words):
             break
@@ -577,10 +399,13 @@ def split_into_chunks(
 
 
 # ============================================================
-# TOKENIZE TEXT
+# TOKENIZE
 # ============================================================
 
 def tokenize(text):
+    """
+    Convert text into lowercase word tokens.
+    """
 
     return set(
         re.findall(
@@ -591,19 +416,33 @@ def tokenize(text):
 
 
 # ============================================================
-# SIMPLE TEXT SIMILARITY
+# TEXT SIMILARITY
 # ============================================================
 
 def similarity_score(
     query,
     document
 ):
+    """
+    Simple Jaccard-style similarity.
 
-    query_words = tokenize(query)
+    No NumPy.
+    No embeddings.
+    No vector database.
+    """
 
-    document_words = tokenize(document)
+    query_words = tokenize(
+        query
+    )
 
-    if not query_words or not document_words:
+    document_words = tokenize(
+        document
+    )
+
+    if (
+        not query_words
+        or not document_words
+    ):
         return 0.0
 
     intersection = (
@@ -624,15 +463,28 @@ def similarity_score(
         / len(union)
     )
 
-    query_lower = query.lower().strip()
+    # --------------------------------------------------------
+    # Exact phrase bonus
+    # --------------------------------------------------------
 
-    document_lower = document.lower()
+    query_lower = (
+        query.lower().strip()
+    )
+
+    document_lower = (
+        document.lower()
+    )
 
     if (
         query_lower
         and query_lower in document_lower
     ):
+
         score += 1.0
+
+    # --------------------------------------------------------
+    # Important word bonus
+    # --------------------------------------------------------
 
     important_words = [
         word
@@ -663,8 +515,11 @@ def similarity_score(
 def retrieve_relevant_chunks(
     query,
     documents,
-    top_k=5
+    top_k=TOP_K
 ):
+    """
+    Retrieve the most relevant document chunks.
+    """
 
     scored_chunks = []
 
@@ -713,8 +568,13 @@ def add_document(
     filename,
     text
 ):
+    """
+    Add a document to JSON knowledge base.
+    """
 
-    text = clean_text(text)
+    text = clean_text(
+        text
+    )
 
     if not text:
         return 0
@@ -730,6 +590,7 @@ def add_document(
 
     documents = load_documents()
 
+    # Remove old copy
     documents = [
         document
         for document in documents
@@ -743,62 +604,250 @@ def add_document(
         }
     )
 
-    save_documents(documents)
+    save_documents(
+        documents
+    )
 
     return len(chunks)
 
 
 # ============================================================
-# GENERATE ANSWER
+# REMOVE THINKING TAGS
 # ============================================================
 
-def generate_answer(
-    question,
-    context
-):
+def clean_model_response(response):
+    """
+    Remove accidental thinking tags from the model response.
+    """
 
-    if not ollama_ready:
+    if not response:
+        return ""
 
-        return (
-            "❌ Ollama is not available. "
-            "The AI model could not be started."
-        )
-
-    prompt_template = (
-        ChatPromptTemplate.from_template(
-            PROMPT_TEMPLATE
-        )
+    response = str(
+        response
     )
 
-    prompt = prompt_template.format(
-        context=context,
-        question=question
-    )
-
-    model = OllamaLLM(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_URL,
-        options={
-            "num_predict": 800,
-            "temperature": 0.3
-        }
-    )
-
-    response = model.invoke(prompt)
-
-    if response is None:
-        return "No response was generated."
-
-    response = str(response)
-
+    # Remove complete <think>...</think>
     response = re.sub(
         r"<think>.*?</think>",
         "",
         response,
         flags=re.DOTALL
+        | re.IGNORECASE
+    )
+
+    # Remove orphan tags
+    response = re.sub(
+        r"</?think>",
+        "",
+        response,
+        flags=re.IGNORECASE
     )
 
     return response.strip()
+
+
+# ============================================================
+# CALL OLLAMA CLOUD
+# ============================================================
+
+def call_ollama_cloud(
+    question,
+    context
+):
+    """
+    Send the RAG prompt directly to Ollama Cloud.
+
+    IMPORTANT:
+
+    This function DOES NOT:
+
+    - install Ollama
+    - run Ollama locally
+    - use localhost
+    - use ollama serve
+    - download a model
+
+    It sends HTTPS requests directly to:
+
+        https://ollama.com/api/chat
+    """
+
+    api_key = get_ollama_api_key()
+
+    if not api_key:
+
+        raise RuntimeError(
+            "Ollama Cloud API key is missing. "
+            "Add OLLAMA_API_KEY to Streamlit Secrets."
+        )
+
+    prompt = PROMPT_TEMPLATE.format(
+        context=context,
+        question=question
+    )
+
+    headers = {
+        "Authorization": (
+            f"Bearer {api_key}"
+        ),
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": OLLAMA_MODEL,
+
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+
+        "stream": False,
+
+        "options": {
+            "temperature": TEMPERATURE,
+            "num_predict": MAX_OUTPUT_TOKENS
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            OLLAMA_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=180
+        )
+
+    except requests.exceptions.Timeout:
+
+        raise RuntimeError(
+            "Ollama Cloud request timed out. "
+            "Please try again."
+        )
+
+    except requests.exceptions.ConnectionError:
+
+        raise RuntimeError(
+            "Could not connect to Ollama Cloud. "
+            "Please check your internet connection."
+        )
+
+    except requests.exceptions.RequestException as e:
+
+        raise RuntimeError(
+            f"Ollama Cloud connection error: {e}"
+        )
+
+    # --------------------------------------------------------
+    # Authentication
+    # --------------------------------------------------------
+
+    if response.status_code in (
+        401,
+        403
+    ):
+
+        raise RuntimeError(
+            "Ollama Cloud authentication failed. "
+            "Your OLLAMA_API_KEY may be invalid or expired."
+        )
+
+    # --------------------------------------------------------
+    # Rate limit
+    # --------------------------------------------------------
+
+    if response.status_code == 429:
+
+        raise RuntimeError(
+            "Ollama Cloud rate limit or usage limit "
+            "was reached. Please try again later."
+        )
+
+    # --------------------------------------------------------
+    # Other HTTP errors
+    # --------------------------------------------------------
+
+    if response.status_code != 200:
+
+        try:
+
+            error_data = (
+                response.json()
+            )
+
+            error_message = (
+                error_data.get(
+                    "error",
+                    response.text
+                )
+            )
+
+        except Exception:
+
+            error_message = (
+                response.text
+            )
+
+        raise RuntimeError(
+            f"Ollama Cloud returned "
+            f"HTTP {response.status_code}: "
+            f"{error_message}"
+        )
+
+    # --------------------------------------------------------
+    # Parse response
+    # --------------------------------------------------------
+
+    try:
+
+        data = response.json()
+
+    except Exception:
+
+        raise RuntimeError(
+            "Ollama Cloud returned an invalid response."
+        )
+
+    # Ollama chat API response:
+    #
+    # {
+    #   "message": {
+    #       "role": "assistant",
+    #       "content": "..."
+    #   }
+    # }
+
+    message = data.get(
+        "message"
+    )
+
+    if not isinstance(
+        message,
+        dict
+    ):
+
+        raise RuntimeError(
+            "Ollama Cloud response did not "
+            "contain an assistant message."
+        )
+
+    answer = message.get(
+        "content",
+        ""
+    )
+
+    if not answer:
+
+        raise RuntimeError(
+            "Ollama Cloud returned an empty answer."
+        )
+
+    return clean_model_response(
+        answer
+    )
 
 
 # ============================================================
@@ -806,6 +855,14 @@ def generate_answer(
 # ============================================================
 
 def query_rag(question):
+    """
+    Complete RAG pipeline:
+
+    1. Load JSON documents
+    2. Retrieve relevant chunks
+    3. Build context
+    4. Send context to Ollama Cloud
+    """
 
     documents = load_documents()
 
@@ -820,7 +877,7 @@ def query_rag(question):
     results = retrieve_relevant_chunks(
         question,
         documents,
-        top_k=5
+        top_k=TOP_K
     )
 
     if not results:
@@ -844,56 +901,61 @@ def query_rag(question):
         source = result["source"]
 
         if source not in sources:
-            sources.append(source)
 
-    context = "\n\n---\n\n".join(
-        context_parts
+            sources.append(
+                source
+            )
+
+    context = (
+        "\n\n---\n\n".join(
+            context_parts
+        )
     )
 
-    response = generate_answer(
+    answer = call_ollama_cloud(
         question,
         context
     )
 
-    return response, sources
-
-
-# ============================================================
-# STREAMLIT CONFIG
-# ============================================================
-
-st.set_page_config(
-    page_title="RAG AI Tutor",
-    page_icon="📚",
-    layout="centered"
-)
+    return (
+        answer,
+        sources
+    )
 
 
 # ============================================================
 # HEADER
 # ============================================================
 
-st.title("📚 RAG-Chatbot")
+st.title(
+    "📚 RAG-Chatbot"
+)
 
 st.markdown(
-    "Chat with your PDFs like a **Gen-Z Teacher** 📚"
+    "Chat with your PDFs like a "
+    "**Gen-Z Teacher** 📚"
 )
 
 
 # ============================================================
-# OLLAMA STATUS
+# OLLAMA CLOUD STATUS
 # ============================================================
 
-if ollama_ready:
+cloud_ready, cloud_message = (
+    test_ollama_cloud()
+)
+
+if cloud_ready:
 
     st.success(
-        f"🦙 Ollama is ready • `{OLLAMA_MODEL}`"
+        f"☁️ Ollama Cloud connected • "
+        f"`{OLLAMA_MODEL}`"
     )
 
 else:
 
-    st.error(
-        "❌ Ollama could not be initialized."
+    st.warning(
+        "☁️ Ollama Cloud API key is not configured yet."
     )
 
 
@@ -931,7 +993,9 @@ else:
 # UPLOAD SECTION
 # ============================================================
 
-st.subheader("📂 Upload New Docs")
+st.subheader(
+    "📂 Upload New Docs"
+)
 
 uploaded_files = st.file_uploader(
     "Upload your notes (PDF or TXT)",
@@ -979,6 +1043,8 @@ if uploaded_files:
                 f"{total_chunks_added} text chunks stored."
             )
 
+            st.rerun()
+
         else:
 
             st.error(
@@ -991,15 +1057,21 @@ if uploaded_files:
 # ASK QUESTIONS
 # ============================================================
 
-st.subheader("💬 Ask Questions")
+st.subheader(
+    "💬 Ask Questions"
+)
 
 query_text = st.text_input(
     "Ask me anything from your docs:",
-    placeholder="Example: What is Human Values?"
+    placeholder=(
+        "Example: What is Human Values?"
+    )
 )
 
 
-if st.button("Ask"):
+if st.button(
+    "Ask"
+):
 
     if not query_text.strip():
 
@@ -1007,25 +1079,42 @@ if st.button("Ask"):
             "Please type a question first. 🤌"
         )
 
+    elif not cloud_ready:
+
+        st.error(
+            "☁️ Ollama Cloud is not configured. "
+            "Please add your OLLAMA_API_KEY "
+            "to Streamlit Secrets."
+        )
+
     else:
 
         try:
 
             with st.spinner(
-                "Searching your documents... 🔎"
+                "Searching your documents and "
+                "asking Ollama Cloud... 🦙"
             ):
 
-                response, sources = query_rag(
-                    query_text
+                response, sources = (
+                    query_rag(
+                        query_text
+                    )
                 )
 
-            st.subheader("📝 Answer")
+            st.subheader(
+                "📝 Answer"
+            )
 
-            st.write(response)
+            st.write(
+                response
+            )
 
             if sources:
 
-                st.subheader("📌 Sources")
+                st.subheader(
+                    "📌 Sources"
+                )
 
                 for source in sources:
 
@@ -1037,10 +1126,12 @@ if st.button("Ask"):
         except Exception as e:
 
             st.error(
-                "The question could not be processed."
+                "The question could not be processed. ❌"
             )
 
-            st.exception(e)
+            st.error(
+                str(e)
+            )
 
 
 # ============================================================
@@ -1049,10 +1140,16 @@ if st.button("Ask"):
 
 with st.sidebar:
 
-    st.header("⚙️ Settings")
+    st.header(
+        "⚙️ Settings"
+    )
 
     st.write(
-        f"**Ollama model:** `{OLLAMA_MODEL}`"
+        f"**AI:** Ollama Cloud"
+    )
+
+    st.write(
+        f"**Model:** `{OLLAMA_MODEL}`"
     )
 
     st.write(
@@ -1062,6 +1159,20 @@ with st.sidebar:
     st.write(
         "**Vector database:** Not required"
     )
+
+    st.divider()
+
+    if cloud_ready:
+
+        st.success(
+            "☁️ Ollama Cloud: Connected"
+        )
+
+    else:
+
+        st.warning(
+            "☁️ Ollama Cloud: Not configured"
+        )
 
     st.divider()
 
